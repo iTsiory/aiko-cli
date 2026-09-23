@@ -115,6 +115,14 @@ enum ProjectsCommand {
 #[derive(Subcommand)]
 enum CloudCommand {
     Status,
+    /// Comparer les deux versions des tâches en conflit
+    Conflicts,
+    /// Choisir la version locale ou distante d'un conflit
+    Resolve {
+        uuid: String,
+        #[arg(long, value_enum)]
+        strategy: ResolutionStrategy,
+    },
     /// Configurer la synchronisation sur la gateway sélectionnée
     Configure {
         #[arg(long = "cloud-url")]
@@ -126,6 +134,21 @@ enum CloudCommand {
         #[arg(long)]
         disabled: bool,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ResolutionStrategy {
+    Local,
+    Remote,
+}
+
+impl ResolutionStrategy {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Remote => "remote",
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -496,7 +519,7 @@ fn display(cli: &Cli, value: Value, kind: &str) -> Result<(), CliError> {
         "status" if value.get("ok").and_then(Value::as_bool) != Some(true) => {
             return Err(CliError::protocol("/api/ping : ok=true attendu"))
         }
-        "projects" | "tasks" => {
+        "projects" | "tasks" | "conflicts" => {
             expect_array(&value, kind)?;
         }
         "created"
@@ -560,6 +583,35 @@ fn display(cli: &Cli, value: Value, kind: &str) -> Result<(), CliError> {
                 println!(
                     "{id}\t{}\t{title}{uuid}",
                     task.get("status").and_then(Value::as_str).unwrap_or("?")
+                );
+            }
+        }
+        "conflicts" => {
+            let conflicts = expect_array(&value, "/api/task-sync/conflicts")?;
+            if conflicts.is_empty() {
+                println!("Aucun conflit");
+            }
+            for conflict in conflicts {
+                let uuid = conflict
+                    .get("uuid")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| CliError::protocol("Conflit sans uuid"))?;
+                let local = conflict
+                    .get("local")
+                    .ok_or_else(|| CliError::protocol("Conflit sans version locale"))?;
+                let remote = conflict
+                    .get("remote")
+                    .ok_or_else(|| CliError::protocol("Conflit sans version distante"))?;
+                println!("Conflit {uuid}");
+                println!(
+                    "  local  : {}",
+                    serde_json::to_string_pretty(local)
+                        .map_err(|e| CliError::protocol(e.to_string()))?
+                );
+                println!(
+                    "  remote : {}",
+                    serde_json::to_string_pretty(remote)
+                        .map_err(|e| CliError::protocol(e.to_string()))?
                 );
             }
         }
@@ -709,6 +761,11 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 ));
             }
         }
+        Command::Cloud {
+            command: CloudCommand::Resolve { uuid, .. },
+        } => {
+            nonempty(uuid, "UUID du conflit")?;
+        }
         _ => {}
     }
 
@@ -820,6 +877,25 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             cli,
             gateway.request(Method::GET, "api/task-sync/status", &[], None)?,
             "sync",
+        ),
+        Command::Cloud {
+            command: CloudCommand::Conflicts,
+        } => display(
+            cli,
+            gateway.request(Method::GET, "api/task-sync/conflicts", &[], None)?,
+            "conflicts",
+        ),
+        Command::Cloud {
+            command: CloudCommand::Resolve { uuid, strategy },
+        } => display(
+            cli,
+            gateway.request(
+                Method::POST,
+                "api/task-sync/resolve",
+                &[],
+                Some(json!({"uuid": uuid, "strategy": strategy.key()})),
+            )?,
+            "ok",
         ),
         Command::Cloud {
             command:
