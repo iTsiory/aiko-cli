@@ -337,3 +337,52 @@ fn profile_file_keeps_only_environment_variable_name() {
     assert!(!String::from_utf8_lossy(&output.stdout).contains("cloud-secret"));
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn conflicts_show_both_versions_and_resolution_sends_strategy() {
+    let uuid = "0123456789abcdef0123456789abcdef";
+    let versions = json!([{"uuid":uuid,
+        "local":{"uuid":uuid,"title":"Version Mac","status":"in_progress","revision":1},
+        "remote":{"uuid":uuid,"title":"Version VPS","status":"done","revision":2}}]);
+    let (url, rx, server) = mock(200, versions.clone());
+    let output = run(&url, &["cloud", "conflicts"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        versions
+    );
+    assert_eq!(
+        rx.recv().unwrap().first_line,
+        "GET /api/task-sync/conflicts HTTP/1.1"
+    );
+    server.join().unwrap();
+
+    let (url, rx, server) = mock(200, versions);
+    let output = Command::new(env!("CARGO_BIN_EXE_aiko"))
+        .args(["--gateway-url", &url, "cloud", "conflicts"])
+        .env("AIKO_LOCAL_BEARER_TOKEN", "test-secret")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let human = String::from_utf8_lossy(&output.stdout);
+    assert!(human.contains("Version Mac"));
+    assert!(human.contains("Version VPS"));
+    rx.recv().unwrap();
+    server.join().unwrap();
+
+    for strategy in ["local", "remote"] {
+        let (url, rx, server) = mock(200, json!({"ok":true}));
+        let output = run(&url, &["cloud", "resolve", uuid, "--strategy", strategy]);
+        assert_eq!(output.status.code(), Some(0));
+        let request = rx.recv().unwrap();
+        assert_eq!(request.first_line, "POST /api/task-sync/resolve HTTP/1.1");
+        assert_eq!(request.body, json!({"uuid":uuid,"strategy":strategy}));
+        server.join().unwrap();
+    }
+
+    let output = run(
+        "http://127.0.0.1:1",
+        &["cloud", "resolve", uuid, "--strategy", "merge"],
+    );
+    assert_eq!(output.status.code(), Some(2));
+}
