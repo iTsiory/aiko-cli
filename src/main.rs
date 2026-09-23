@@ -160,6 +160,8 @@ enum TasksCommand {
         project: Option<String>,
     },
     Create {
+        #[arg(long, help = "Projet enregistré qui possède cette tâche")]
+        project: Option<String>,
         #[arg(long)]
         card: String,
         #[arg(long)]
@@ -711,12 +713,16 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 )?;
             }
             TasksCommand::Create {
+                project,
                 card,
                 title,
                 parent,
                 agent,
                 ..
             } => {
+                if let Some(project) = project {
+                    nonempty(project, "Projet")?;
+                }
                 nonempty(card, "Carte")?;
                 nonempty(title, "Titre")?;
                 if let Some(id) = parent {
@@ -808,6 +814,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             ),
             TasksCommand::List { .. } => unreachable!(),
             TasksCommand::Create {
+                project,
                 card,
                 title,
                 parent,
@@ -815,6 +822,9 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 status,
             } => {
                 let mut body = json!({"card_key":card,"title":title});
+                if let Some(project) = project {
+                    body["project"] = json!(project);
+                }
                 if let Some(parent) = parent {
                     body["parent_id"] = json!(parent);
                 }

@@ -151,6 +151,27 @@ fn task_create_and_project_list_preserve_contract() {
     );
     server.join().unwrap();
 
+    let (url, rx, server) = mock(200, json!({"id":43}));
+    let output = run(
+        &url,
+        &[
+            "tasks",
+            "create",
+            "--project",
+            "projet espace",
+            "--card",
+            "terminal-vps",
+            "--title",
+            "Sans carte desktop",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        rx.recv().unwrap().body,
+        json!({"project":"projet espace","card_key":"terminal-vps","title":"Sans carte desktop"})
+    );
+    server.join().unwrap();
+
     let (url, rx, server) = mock(
         200,
         json!([{"id":42,"task_uuid":"abc","title":"Écrire","status":"pending"}]),
@@ -276,6 +297,20 @@ fn errors_have_stable_exit_codes_and_do_not_expose_token() {
     let output = run(
         "http://127.0.0.1:1",
         &["tasks", "create", "--card", "x", "--title", " "],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let output = run(
+        "http://127.0.0.1:1",
+        &[
+            "tasks",
+            "create",
+            "--project",
+            " ",
+            "--card",
+            "x",
+            "--title",
+            "Valide",
+        ],
     );
     assert_eq!(output.status.code(), Some(2));
 }
