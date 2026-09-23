@@ -397,15 +397,17 @@ fn resolved_profile(cli: &Cli, config: &Config) -> Result<(Url, String), CliErro
                     .ok()
                     .filter(|v| !v.trim().is_empty())
                     .or_else(|| {
-                        env::var_os("HOME")
-                            .and_then(|home| {
+                        [env::var_os("AIKO_CLOUD_HOME"), env::var_os("HOME")]
+                            .into_iter()
+                            .flatten()
+                            .find_map(|home| {
                                 fs::read_to_string(
                                     PathBuf::from(home).join("aiko-agent/.remote-token"),
                                 )
                                 .ok()
+                                .map(|v| v.trim().to_owned())
+                                .filter(|v| !v.is_empty())
                             })
-                            .map(|v| v.trim().to_owned())
-                            .filter(|v| !v.is_empty())
                     })
             } else {
                 None
@@ -415,7 +417,7 @@ fn resolved_profile(cli: &Cli, config: &Config) -> Result<(Url, String), CliErro
             CliError::auth(format!(
                 "Jeton absent : définir {env_name}{}",
                 if matches!(cli.profile, ProfileName::Local) {
-                    " ou ~/aiko-agent/.remote-token"
+                    " ou $AIKO_CLOUD_HOME/aiko-agent/.remote-token ou ~/aiko-agent/.remote-token"
                 } else {
                     ""
                 }
