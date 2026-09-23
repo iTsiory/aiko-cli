@@ -386,3 +386,37 @@ fn conflicts_show_both_versions_and_resolution_sends_strategy() {
     );
     assert_eq!(output.status.code(), Some(2));
 }
+
+#[test]
+fn local_profile_reads_cloud_service_home_token() {
+    let root = std::env::temp_dir().join(format!(
+        "aiko-cli-cloud-home-{}-{:?}",
+        std::process::id(),
+        thread::current().id()
+    ));
+    let agent_dir = root.join("aiko-agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(agent_dir.join(".remote-token"), "service-token\n").unwrap();
+    let (url, rx, server) = mock(200, json!({"ok":true,"version":"0.9.128"}));
+    let output = Command::new(env!("CARGO_BIN_EXE_aiko"))
+        .args(["--gateway-url", &url, "--json", "status"])
+        .env_remove("AIKO_LOCAL_BEARER_TOKEN")
+        .env_remove("AIKO_REMOTE_TOKEN")
+        .env("AIKO_CLOUD_HOME", &root)
+        .env("AIKO_CONFIG_FILE", root.join("config.json"))
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        rx.recv().unwrap().authorization.to_ascii_lowercase(),
+        "authorization: bearer service-token"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("service-token"));
+    server.join().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
