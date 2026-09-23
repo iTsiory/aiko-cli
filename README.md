@@ -21,3 +21,7 @@ Voir [la procédure complète](docs/aiko-cli.md) pour les profils, les commandes
 cargo test --locked
 cargo fmt -- --check
 ```
+
+## Licence
+
+[MIT](LICENSE)
