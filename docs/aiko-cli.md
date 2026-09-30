@@ -1,6 +1,8 @@
 # CLI `aiko`
 
-Le binaire `aiko` parle à la gateway HTTP du backend Aiko. Les commandes `tasks` utilisent les tâches des cartes, distinctes des TODO du jour. Les IDs numériques des tâches appartiennent à la base SQLite de **la gateway ciblée** : ne les réutilisez pas sur une autre instance. Le champ `task_uuid`, s'il est fourni, est conservé dans la sortie `--json` pour la synchronisation.
+Le binaire `aiko` parle à **une** gateway HTTP du backend Aiko, celle du profil choisi. Chaque machine — un Mac (desktop) ou un VPS — est **autonome** : elle a ses propres projets, cartes et tâches, et aucune synchronisation ne les relie. Le CLI n'appelle jamais une autre gateway à la place de celle qui a été choisie, et ne rejoue rien ailleurs si elle ne répond pas.
+
+Les commandes `tasks` utilisent les tâches des cartes, distinctes des TODO du jour. Les IDs numériques des tâches appartiennent à la base SQLite de **la gateway ciblée** : ne les réutilisez pas sur une autre machine. Le champ `task_uuid`, identifiant stable de la tâche sur cette gateway, est conservé dans la sortie `--json`.
 
 ## Installation macOS et Linux/VPS
 
@@ -13,17 +15,22 @@ L'installation produit `~/.cargo/bin/aiko`. Ajouter `~/.cargo/bin` au `PATH` si 
 
 ## Profils et secrets
 
-`local` cible par défaut `http://127.0.0.1:4823`. Son jeton Bearer vient de `AIKO_LOCAL_BEARER_TOKEN`, puis de `AIKO_REMOTE_TOKEN`, puis de `$AIKO_CLOUD_HOME/aiko-agent/.remote-token` si `AIKO_CLOUD_HOME` est défini, puis de `~/aiko-agent/.remote-token`. Sur le VPS, le service a pour `HOME` `AIKO_CLOUD_HOME` (par défaut systemd : `/var/lib/aiko-cloud`) et crée ce jeton en mode `0600`. `AIKO_LOCAL_TOKEN` / `.local-token` est un autre secret et ne convient pas au Bearer.
+Deux profils, deux gateways distinctes :
+
+- `local` : la gateway de **cette** machine, Mac ou VPS, par défaut `http://127.0.0.1:4823` ;
+- `cloud` (alias `vps`) : la gateway d'un VPS autonome, jointe depuis un autre poste.
+
+Le jeton Bearer de `local` vient de `AIKO_LOCAL_BEARER_TOKEN`, puis — **seulement si l'URL est en boucle locale** — de `AIKO_REMOTE_TOKEN`, de `$AIKO_CLOUD_HOME/aiko-agent/.remote-token` si `AIKO_CLOUD_HOME` est défini, puis de `~/aiko-agent/.remote-token`. Ces jetons de repli sont ceux de la gateway de la machine : ils ne sont jamais envoyés à une URL distante, même avec `--gateway-url`. Le profil `cloud` n'a aucun repli : son jeton vient de la variable nommée (`AIKO_CLOUD_BEARER_TOKEN` par défaut). Sur le VPS, le service a pour `HOME` `AIKO_CLOUD_HOME` (par défaut systemd : `/var/lib/aiko-cloud`) et crée ce jeton en mode `0600`. `AIKO_LOCAL_TOKEN` / `.local-token` est un autre secret et ne convient pas au Bearer.
 
 ```sh
 aiko profile set local --url http://127.0.0.1:4823
 aiko profile set cloud --url https://aiko.example.org --token-env AIKO_CLOUD_BEARER_TOKEN
 export AIKO_CLOUD_BEARER_TOKEN='…'
-aiko --profile cloud status
-aiko --profile cloud projects list
+aiko --profile vps status
+aiko --profile vps projects list
 ```
 
-Depuis un poste distant, ouvrir un tunnel `ssh -L 4824:127.0.0.1:4823 utilisateur@vps`, puis configurer `cloud` avec `http://127.0.0.1:4824` et le Bearer du VPS dans `AIKO_CLOUD_BEARER_TOKEN`. Un proxy HTTPS vers la gateway du VPS convient aussi. La gateway du VPS écoute `127.0.0.1:4823` par défaut ; le CLI n'attend aucune route cloud propre au runtime. `aiko status` vérifie `/api/ping` ; `aiko cloud status` lit l'état de la **synchronisation des tâches** fourni par la gateway locale.
+Depuis un poste distant, ouvrir un tunnel `ssh -L 4824:127.0.0.1:4823 utilisateur@vps`, puis configurer `cloud` avec `http://127.0.0.1:4824` et le Bearer du VPS dans `AIKO_CLOUD_BEARER_TOKEN`. Un proxy HTTPS vers la gateway du VPS (Tailscale Serve) convient aussi. La gateway du VPS écoute `127.0.0.1:4823` par défaut. `aiko status` vérifie `/api/ping` et nomme la machine qui répond quand la gateway publie `machine.kind` (`Mac (desktop)` ou `VPS autonome`).
 
 Le fichier `~/.config/aiko/config.json` ne contient que les URL et les **noms** des variables de jeton. Sur Unix, le CLI crée le dossier en mode `0700` et le fichier en mode `0600`. `AIKO_CONFIG_FILE` déplace ce fichier. Les options globales `--gateway-url` et `--gateway-token-env` remplacent le profil pour un appel. `aiko --profile cloud profile show` affiche la configuration sans afficher le jeton.
 
@@ -41,13 +48,9 @@ aiko tasks create --project mon-projet --card 'terminal-vps' --title 'Vérifier 
 aiko tasks update 42 --title 'Préparer le VPS' --status in_progress
 aiko tasks done 42
 aiko tasks delete 42
-aiko cloud status
-aiko sync
-aiko cloud conflicts
-aiko cloud resolve 0123456789abcdef0123456789abcdef --strategy local
 ```
 
-`tasks list --card` appelle `GET /api/tasks?card_key=…`. `tasks list --project` appelle `GET /api/task-sync/tasks?project=…` pour inclure les cartes absentes. `tasks create --project` transmet le nom d'un projet enregistré à `POST /api/tasks` : utilisez-le pour une clé de terminal VPS qui n'est pas un chemin de carte desktop. Sans lui, les anciennes gateways infèrent le projet depuis le chemin `card_key`, et une clé arbitraire peut créer une tâche hors projet qui ne sera pas synchronisée. Mise à jour, fin et suppression restent sur les routes `/api/tasks*` existantes et exigent l'ID **local** pour les mutations. Les statuts acceptés sont `pending`, `in_progress`, `done`, `cancelled`. Les options sont validées avant l'appel HTTP.
+`tasks list --card` appelle `GET /api/tasks?card_key=…`. `tasks list --project` appelle `GET /api/project/tasks?project=…` : toutes les tâches du projet sur cette gateway, cartes fermées comprises, en tableau brut (`id`, `task_uuid`, `project`, `card_key`, `parent_id`, `agent`, `title`, `status`, `position`, `created_at`, `updated_at`) ; un projet inconnu de cette machine répond 403. `tasks create --project` transmet le nom d'un projet enregistré à `POST /api/tasks` : utilisez-le pour une clé de terminal VPS qui n'est pas un chemin de carte desktop. Sans lui, les anciennes gateways infèrent le projet depuis le chemin `card_key`, et une clé arbitraire peut créer une tâche hors projet. Mise à jour, fin et suppression restent sur les routes `/api/tasks*` existantes et exigent l'ID **local** pour les mutations. Les statuts acceptés sont `pending`, `in_progress`, `done`, `cancelled`. Les options sont validées avant l'appel HTTP.
 
 Avant la première tâche sur un serveur neuf, enregistrer le projet par la route réelle de la gateway (le dossier doit exister et être accessible au service). Par exemple, sur le VPS, après avoir placé le Bearer dans `AIKO_LOCAL_BEARER_TOKEN` :
 
@@ -60,20 +63,7 @@ curl -fsS -H "Authorization: Bearer $AIKO_LOCAL_BEARER_TOKEN" \
 aiko projects list
 ```
 
-Le Mac et le VPS doivent enregistrer le **même nom** de projet ; leurs chemins locaux peuvent différer.
-
-La synchronisation est configurée **sur la gateway ciblée** :
-
-```sh
-export AIKO_SYNC_TOKEN='…'
-aiko cloud configure --cloud-url https://cloud.example.org --project mon-projet --token-env AIKO_SYNC_TOKEN
-aiko cloud status
-aiko sync
-```
-
-`cloud status`, `cloud configure` et `sync` utilisent respectivement `GET /api/task-sync/status`, `POST /api/task-sync/config` et `POST /api/task-sync/run`. Une gateway qui ne publie pas ces routes renvoie une erreur HTTP ; le CLI ne simule aucune synchronisation. `--profile cloud` choisit **la gateway appelée** ; `cloud configure --cloud-url` désigne **le serveur avec lequel cette gateway synchronise**. Le jeton cloud est facultatif pour modifier une configuration existante : si `AIKO_SYNC_TOKEN` est absent, le CLI omet `token` dans la requête.
-
-`aiko cloud conflicts` lit `GET /api/task-sync/conflicts` et montre les versions `local` et `remote` avec leur UUID. `aiko cloud resolve <uuid> --strategy local|remote` appelle `POST /api/task-sync/resolve`. Choisir `local` garde l'édition locale et la publie au prochain cycle ; choisir `remote` adopte immédiatement la version du VPS. Utiliser `--json` pour comparer tous les champs sans formatage, puis `aiko sync` si l'on veut lancer le cycle sans attendre le worker. La résolution exige un choix explicite pour chaque conflit.
+Chaque machine enregistre ses propres projets : un projet importé sur le VPS n'apparaît pas sur le Mac, et inversement. Les commandes `sync` et `cloud` ont été retirées avec la synchronisation Aiko Cloud ; les routes `/api/task-sync/*` n'existent plus côté gateway.
 
 ## Sortie et erreurs
 
@@ -85,4 +75,4 @@ aiko sync
 2. Identifier une carte dans Aiko, puis lancer `aiko tasks list --card '<clé>'`.
 3. Créer une tâche : `aiko tasks create --project <nom> --card '<clé>' --title 'Vérifier le CLI'` ; noter l'ID local rendu.
 4. Terminer la tâche avec `aiko tasks done <id>` et relister la carte.
-5. Une fois `/api/task-sync/*` disponible et configuré, lancer `aiko sync`, puis `aiko tasks list --project <nom> --json` pour consulter `task_uuid`.
+5. Lister tout le projet sur cette machine : `aiko tasks list --project <nom> --json`, qui porte aussi `task_uuid`.

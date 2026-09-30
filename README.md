@@ -1,6 +1,7 @@
 # aiko CLI
 
 Client Rust autonome pour la gateway HTTP d'[Aiko](https://aiko.youngdev.mg), sur macOS et Linux.
+Chaque appel vise une seule gateway — celle d'un Mac ou d'un VPS, machines autonomes sans synchronisation entre elles.
 
 ## Installer
 

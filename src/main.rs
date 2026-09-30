@@ -45,9 +45,15 @@ struct Cli {
     command: Command,
 }
 
+/// Chaque profil désigne UNE gateway, sur UNE machine autonome. Aucune ne
+/// synchronise avec une autre, et le CLI n'essaie jamais une gateway à la
+/// place de celle qui a été choisie.
 #[derive(Clone, Copy, ValueEnum)]
 enum ProfileName {
+    /// La gateway de cette machine (Mac ou VPS), sur la boucle locale
     Local,
+    /// La gateway d'un VPS autonome, jointe à distance (alias : vps)
+    #[value(alias = "vps")]
     Cloud,
 }
 
@@ -81,18 +87,11 @@ enum Command {
         #[command(subcommand)]
         command: ProjectsCommand,
     },
-    /// Gérer les tâches des cartes
+    /// Gérer les tâches des cartes de la gateway choisie
     Tasks {
         #[command(subcommand)]
         command: TasksCommand,
     },
-    /// État de la synchronisation configurée sur la gateway
-    Cloud {
-        #[command(subcommand)]
-        command: CloudCommand,
-    },
-    /// Déclencher la synchronisation configurée sur la gateway
-    Sync,
 }
 
 #[derive(Subcommand)]
@@ -113,50 +112,16 @@ enum ProjectsCommand {
 }
 
 #[derive(Subcommand)]
-enum CloudCommand {
-    Status,
-    /// Comparer les deux versions des tâches en conflit
-    Conflicts,
-    /// Choisir la version locale ou distante d'un conflit
-    Resolve {
-        uuid: String,
-        #[arg(long, value_enum)]
-        strategy: ResolutionStrategy,
-    },
-    /// Configurer la synchronisation sur la gateway sélectionnée
-    Configure {
-        #[arg(long = "cloud-url")]
-        url: String,
-        #[arg(long)]
-        project: String,
-        #[arg(long, default_value = "AIKO_SYNC_TOKEN")]
-        token_env: String,
-        #[arg(long)]
-        disabled: bool,
-    },
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum ResolutionStrategy {
-    Local,
-    Remote,
-}
-
-impl ResolutionStrategy {
-    fn key(self) -> &'static str {
-        match self {
-            Self::Local => "local",
-            Self::Remote => "remote",
-        }
-    }
-}
-
-#[derive(Subcommand)]
 enum TasksCommand {
+    /// Lister les tâches d'une carte, ou de tout un projet de cette gateway
     List {
-        #[arg(long, conflicts_with = "project")]
+        #[arg(
+            long,
+            conflicts_with = "project",
+            help = "Clé de carte (GET /api/tasks?card_key=)"
+        )]
         card: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Projet enregistré (GET /api/project/tasks?project=)")]
         project: Option<String>,
     },
     Create {
@@ -387,11 +352,16 @@ fn resolved_profile(cli: &Cli, config: &Config) -> Result<(Url, String), CliErro
         .or_else(|| selected.and_then(|p| p.token_env.as_deref()))
         .unwrap_or(cli.profile.default_token_env());
     nonempty(env_name, "Nom de variable du jeton")?;
+    // Les jetons de repli (`AIKO_REMOTE_TOKEN`, `.remote-token`) sont ceux de
+    // la gateway de CETTE machine : ils ne partent que vers la boucle locale.
+    // Vers une autre URL, le jeton doit être nommé explicitement — sinon le
+    // secret d'un Mac serait présenté à un VPS, ou l'inverse.
     let token = env::var(env_name)
         .ok()
         .filter(|v| !v.trim().is_empty())
         .or_else(|| {
             if matches!(cli.profile, ProfileName::Local)
+                && is_loopback(&url)
                 && cli.gateway_token_env.is_none()
                 && selected.and_then(|p| p.token_env.as_ref()).is_none()
             {
@@ -418,7 +388,7 @@ fn resolved_profile(cli: &Cli, config: &Config) -> Result<(Url, String), CliErro
         .ok_or_else(|| {
             CliError::auth(format!(
                 "Jeton absent : définir {env_name}{}",
-                if matches!(cli.profile, ProfileName::Local) {
+                if matches!(cli.profile, ProfileName::Local) && is_loopback(&url) {
                     " ou $AIKO_CLOUD_HOME/aiko-agent/.remote-token ou ~/aiko-agent/.remote-token"
                 } else {
                     ""
@@ -523,7 +493,7 @@ fn display(cli: &Cli, value: Value, kind: &str) -> Result<(), CliError> {
         "status" if value.get("ok").and_then(Value::as_bool) != Some(true) => {
             return Err(CliError::protocol("/api/ping : ok=true attendu"))
         }
-        "projects" | "tasks" | "conflicts" => {
+        "projects" | "tasks" => {
             expect_array(&value, kind)?;
         }
         "created"
@@ -535,9 +505,6 @@ fn display(cli: &Cli, value: Value, kind: &str) -> Result<(), CliError> {
             return Err(CliError::protocol("Réponse sans id positif"))
         }
         "ok" => expect_ok(&value)?,
-        "sync" if value.get("enabled").and_then(Value::as_bool).is_none() => {
-            return Err(CliError::protocol("Statut sync sans enabled"))
-        }
         _ => {}
     }
     if cli.json {
@@ -549,8 +516,15 @@ fn display(cli: &Cli, value: Value, kind: &str) -> Result<(), CliError> {
     }
     match kind {
         "status" => {
+            // `machine.kind` (`desktop` | `vps`) dit quelle machine répond ;
+            // absent sur une gateway antérieure au champ.
+            let machine = match value.pointer("/machine/kind").and_then(Value::as_str) {
+                Some("desktop") => " · Mac (desktop)",
+                Some("vps") => " · VPS autonome",
+                _ => "",
+            };
             println!(
-                "Aiko {} · gateway disponible",
+                "Aiko {} · gateway disponible{machine}",
                 value
                     .get("version")
                     .and_then(Value::as_str)
@@ -590,62 +564,8 @@ fn display(cli: &Cli, value: Value, kind: &str) -> Result<(), CliError> {
                 );
             }
         }
-        "conflicts" => {
-            let conflicts = expect_array(&value, "/api/task-sync/conflicts")?;
-            if conflicts.is_empty() {
-                println!("Aucun conflit");
-            }
-            for conflict in conflicts {
-                let uuid = conflict
-                    .get("uuid")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| CliError::protocol("Conflit sans uuid"))?;
-                let local = conflict
-                    .get("local")
-                    .ok_or_else(|| CliError::protocol("Conflit sans version locale"))?;
-                let remote = conflict
-                    .get("remote")
-                    .ok_or_else(|| CliError::protocol("Conflit sans version distante"))?;
-                println!("Conflit {uuid}");
-                println!(
-                    "  local  : {}",
-                    serde_json::to_string_pretty(local)
-                        .map_err(|e| CliError::protocol(e.to_string()))?
-                );
-                println!(
-                    "  remote : {}",
-                    serde_json::to_string_pretty(remote)
-                        .map_err(|e| CliError::protocol(e.to_string()))?
-                );
-            }
-        }
         "created" => println!("Tâche créée : {}", value["id"]),
         "ok" => println!("OK"),
-        "sync" => {
-            let enabled = value["enabled"].as_bool().unwrap();
-            println!(
-                "Synchronisation : {}",
-                if enabled { "active" } else { "inactive" }
-            );
-            for field in [
-                "project",
-                "url",
-                "last_sync",
-                "pending",
-                "conflicts",
-                "error",
-            ] {
-                if let Some(entry) = value.get(field).filter(|v| !v.is_null()) {
-                    println!(
-                        "{field} : {}",
-                        entry
-                            .as_str()
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| entry.to_string())
-                    );
-                }
-            }
-        }
         _ => return Err(CliError::protocol("Affichage inconnu")),
     }
     Ok(())
@@ -701,8 +621,8 @@ fn run(cli: &Cli) -> Result<(), CliError> {
     }
 
     // Les options sont validées avant toute requête réseau.
-    match &cli.command {
-        Command::Tasks { command } => match command {
+    if let Command::Tasks { command } = &cli.command {
+        match command {
             TasksCommand::List { card, project } => {
                 if card.is_none() && project.is_none() {
                     return Err(CliError::usage("Choisir --card ou --project"));
@@ -750,31 +670,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 }
             }
             TasksCommand::Done { id } | TasksCommand::Delete { id } => positive(*id, "ID")?,
-        },
-        Command::Cloud {
-            command:
-                CloudCommand::Configure {
-                    url,
-                    project,
-                    token_env,
-                    ..
-                },
-        } => {
-            nonempty(project, "Projet")?;
-            nonempty(token_env, "Nom de variable du jeton cloud")?;
-            let url = parse_url(url)?;
-            if url.scheme() == "http" && !is_loopback(&url) && !cli.allow_http {
-                return Err(CliError::usage(
-                    "HTTP cloud hors loopback refusé ; utiliser HTTPS ou --allow-http",
-                ));
-            }
         }
-        Command::Cloud {
-            command: CloudCommand::Resolve { uuid, .. },
-        } => {
-            nonempty(uuid, "UUID du conflit")?;
-        }
-        _ => {}
     }
 
     let gateway = Gateway::new(cli, &config)?;
@@ -806,7 +702,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 cli,
                 gateway.request(
                     Method::GET,
-                    "api/task-sync/tasks",
+                    "api/project/tasks",
                     &[("project", project)],
                     None,
                 )?,
@@ -883,54 +779,6 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 "ok",
             ),
         },
-        Command::Cloud {
-            command: CloudCommand::Status,
-        } => display(
-            cli,
-            gateway.request(Method::GET, "api/task-sync/status", &[], None)?,
-            "sync",
-        ),
-        Command::Cloud {
-            command: CloudCommand::Conflicts,
-        } => display(
-            cli,
-            gateway.request(Method::GET, "api/task-sync/conflicts", &[], None)?,
-            "conflicts",
-        ),
-        Command::Cloud {
-            command: CloudCommand::Resolve { uuid, strategy },
-        } => display(
-            cli,
-            gateway.request(
-                Method::POST,
-                "api/task-sync/resolve",
-                &[],
-                Some(json!({"uuid": uuid, "strategy": strategy.key()})),
-            )?,
-            "ok",
-        ),
-        Command::Cloud {
-            command:
-                CloudCommand::Configure {
-                    url,
-                    project,
-                    token_env,
-                    disabled,
-                },
-        } => {
-            let mut body = json!({"url":url,"project":project,"enabled":!disabled});
-            if let Some(token) = env::var(token_env).ok().filter(|v| !v.trim().is_empty()) {
-                body["token"] = json!(token);
-            }
-            let response =
-                gateway.request(Method::POST, "api/task-sync/config", &[], Some(body))?;
-            display(cli, response, "sync")
-        }
-        Command::Sync => display(
-            cli,
-            gateway.request(Method::POST, "api/task-sync/run", &[], Some(json!({})))?,
-            "sync",
-        ),
         Command::Profile { .. } => unreachable!(),
     }
 }

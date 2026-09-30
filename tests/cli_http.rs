@@ -172,21 +172,48 @@ fn task_create_and_project_list_preserve_contract() {
     );
     server.join().unwrap();
 
-    let (url, rx, server) = mock(
-        200,
-        json!([{"id":42,"task_uuid":"abc","title":"Écrire","status":"pending"}]),
-    );
+    // Le tableau brut de `GET /api/project/tasks`, identifiant stable compris.
+    let tasks = json!([{"id":42,"task_uuid":"8f1c2a","project":"projet espace",
+        "card_key":"terminal-vps","parent_id":null,"agent":null,"title":"Écrire",
+        "status":"pending","position":0,"created_at":"2026-09-30 08:00:00",
+        "updated_at":"2026-09-30 08:00:00"}]);
+    let (url, rx, server) = mock(200, tasks.clone());
     let output = run(&url, &["tasks", "list", "--project", "projet espace"]);
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(
         rx.recv().unwrap().first_line,
-        "GET /api/task-sync/tasks?project=projet+espace HTTP/1.1"
+        "GET /api/project/tasks?project=projet+espace HTTP/1.1"
     );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        tasks
+    );
+    server.join().unwrap();
+
+    let (url, rx, server) = mock(200, tasks);
+    let output = Command::new(env!("CARGO_BIN_EXE_aiko"))
+        .args([
+            "--gateway-url",
+            &url,
+            "tasks",
+            "list",
+            "--project",
+            "projet espace",
+        ])
+        .env("AIKO_LOCAL_BEARER_TOKEN", "test-secret")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "42\tpending\tÉcrire\t8f1c2a\n"
+    );
+    rx.recv().unwrap();
     server.join().unwrap();
 }
 
 #[test]
-fn mutations_and_sync_use_published_routes() {
+fn task_mutations_use_published_routes() {
     for (args, expected, body) in [
         (
             vec!["tasks", "update", "42", "--status", "in_progress"],
@@ -212,68 +239,6 @@ fn mutations_and_sync_use_published_routes() {
         assert_eq!(request.body, body);
         server.join().unwrap();
     }
-    let status = json!({"enabled":true,"project":"demo","url":"https://cloud.example","last_sync":null,"error":null,"pending":1,"conflicts":0});
-    let (url, rx, server) = mock(200, status.clone());
-    let output = run(&url, &["cloud", "status"]);
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(
-        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
-        status
-    );
-    assert_eq!(
-        rx.recv().unwrap().first_line,
-        "GET /api/task-sync/status HTTP/1.1"
-    );
-    server.join().unwrap();
-    let (url, rx, server) = mock(200, status);
-    let output = run(&url, &["sync"]);
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(
-        rx.recv().unwrap().first_line,
-        "POST /api/task-sync/run HTTP/1.1"
-    );
-    server.join().unwrap();
-
-    let status = json!({"enabled":true,"project":"demo","url":"https://cloud.example","last_sync":null,"error":null,"pending":0,"conflicts":0,"cursor":null});
-    let (url, rx, server) = mock(200, status);
-    let output = Command::new(env!("CARGO_BIN_EXE_aiko"))
-        .args([
-            "--gateway-url",
-            &url,
-            "--json",
-            "cloud",
-            "configure",
-            "--cloud-url",
-            "https://cloud.example",
-            "--project",
-            "demo",
-        ])
-        .env("AIKO_LOCAL_BEARER_TOKEN", "test-secret")
-        .env("AIKO_SYNC_TOKEN", "cloud-secret")
-        .env(
-            "AIKO_CONFIG_FILE",
-            format!(
-                "{}/aiko-cli-config-test-{}.json",
-                std::env::temp_dir().display(),
-                std::process::id()
-            ),
-        )
-        .output()
-        .unwrap();
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(!String::from_utf8_lossy(&output.stdout).contains("cloud-secret"));
-    let request = rx.recv().unwrap();
-    assert_eq!(request.first_line, "POST /api/task-sync/config HTTP/1.1");
-    assert_eq!(
-        request.body,
-        json!({"url":"https://cloud.example","token":"cloud-secret","project":"demo","enabled":true})
-    );
-    server.join().unwrap();
 }
 
 #[test]
@@ -374,55 +339,6 @@ fn profile_file_keeps_only_environment_variable_name() {
 }
 
 #[test]
-fn conflicts_show_both_versions_and_resolution_sends_strategy() {
-    let uuid = "0123456789abcdef0123456789abcdef";
-    let versions = json!([{"uuid":uuid,
-        "local":{"uuid":uuid,"title":"Version Mac","status":"in_progress","revision":1},
-        "remote":{"uuid":uuid,"title":"Version VPS","status":"done","revision":2}}]);
-    let (url, rx, server) = mock(200, versions.clone());
-    let output = run(&url, &["cloud", "conflicts"]);
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(
-        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
-        versions
-    );
-    assert_eq!(
-        rx.recv().unwrap().first_line,
-        "GET /api/task-sync/conflicts HTTP/1.1"
-    );
-    server.join().unwrap();
-
-    let (url, rx, server) = mock(200, versions);
-    let output = Command::new(env!("CARGO_BIN_EXE_aiko"))
-        .args(["--gateway-url", &url, "cloud", "conflicts"])
-        .env("AIKO_LOCAL_BEARER_TOKEN", "test-secret")
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(0));
-    let human = String::from_utf8_lossy(&output.stdout);
-    assert!(human.contains("Version Mac"));
-    assert!(human.contains("Version VPS"));
-    rx.recv().unwrap();
-    server.join().unwrap();
-
-    for strategy in ["local", "remote"] {
-        let (url, rx, server) = mock(200, json!({"ok":true}));
-        let output = run(&url, &["cloud", "resolve", uuid, "--strategy", strategy]);
-        assert_eq!(output.status.code(), Some(0));
-        let request = rx.recv().unwrap();
-        assert_eq!(request.first_line, "POST /api/task-sync/resolve HTTP/1.1");
-        assert_eq!(request.body, json!({"uuid":uuid,"strategy":strategy}));
-        server.join().unwrap();
-    }
-
-    let output = run(
-        "http://127.0.0.1:1",
-        &["cloud", "resolve", uuid, "--strategy", "merge"],
-    );
-    assert_eq!(output.status.code(), Some(2));
-}
-
-#[test]
 fn local_profile_reads_cloud_service_home_token() {
     let root = std::env::temp_dir().join(format!(
         "aiko-cli-cloud-home-{}-{:?}",
@@ -453,5 +369,115 @@ fn local_profile_reads_cloud_service_home_token() {
     );
     assert!(!String::from_utf8_lossy(&output.stdout).contains("service-token"));
     server.join().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn sync_commands_are_gone_and_never_reach_the_gateway() {
+    // Port fermé : si le CLI tentait un appel, le code serait 4, pas 2.
+    for args in [
+        vec!["sync"],
+        vec!["cloud", "status"],
+        vec![
+            "cloud",
+            "configure",
+            "--cloud-url",
+            "https://x",
+            "--project",
+            "p",
+        ],
+        vec!["cloud", "conflicts"],
+    ] {
+        let output = run("http://127.0.0.1:1", &args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+    }
+    let help = Command::new(env!("CARGO_BIN_EXE_aiko"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert_eq!(help.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&help.stdout).to_lowercase();
+    assert!(text.contains("tasks"));
+    assert!(!text.contains("sync"), "{text}");
+    assert!(!text.contains("conflict"), "{text}");
+}
+
+#[test]
+fn status_names_the_machine_that_answers() {
+    for (kind, expected) in [("vps", "VPS autonome"), ("desktop", "Mac (desktop)")] {
+        let (url, rx, server) = mock(
+            200,
+            json!({"ok":true,"version":"0.11.19","machine":{"kind":kind}}),
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_aiko"))
+            .args(["--gateway-url", &url, "status"])
+            .env("AIKO_LOCAL_BEARER_TOKEN", "test-secret")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        assert!(String::from_utf8_lossy(&output.stdout).contains(expected));
+        rx.recv().unwrap();
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn vps_is_an_alias_of_the_cloud_profile() {
+    let output = Command::new(env!("CARGO_BIN_EXE_aiko"))
+        .args(["--profile", "vps", "--json", "profile", "show"])
+        .env(
+            "AIKO_CONFIG_FILE",
+            std::env::temp_dir().join(format!("aiko-cli-alias-{}.json", std::process::id())),
+        )
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let shown: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(shown["profile"], "cloud");
+    assert_eq!(shown["token_env"], "AIKO_CLOUD_BEARER_TOKEN");
+}
+
+#[test]
+fn local_machine_token_is_never_sent_to_another_gateway() {
+    let root = std::env::temp_dir().join(format!(
+        "aiko-cli-no-fallback-{}-{:?}",
+        std::process::id(),
+        thread::current().id()
+    ));
+    let agent_dir = root.join("aiko-agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(agent_dir.join(".remote-token"), "mac-token\n").unwrap();
+    // Profil local, URL distante : ni `AIKO_REMOTE_TOKEN` ni le fichier de la
+    // machine ne servent de jeton. Refus avant tout appel réseau (code 3).
+    let output = Command::new(env!("CARGO_BIN_EXE_aiko"))
+        .args(["--gateway-url", "https://198.51.100.7", "status"])
+        .env_remove("AIKO_LOCAL_BEARER_TOKEN")
+        .env("AIKO_REMOTE_TOKEN", "mac-remote-token")
+        .env("HOME", &root)
+        .env("AIKO_CLOUD_HOME", &root)
+        .env("AIKO_CONFIG_FILE", root.join("config.json"))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("mac-token") && !stderr.contains("mac-remote-token"));
+    assert!(!stderr.contains(".remote-token"), "{stderr}");
+
+    // Un profil distant ne lit jamais les jetons de la machine locale.
+    let output = Command::new(env!("CARGO_BIN_EXE_aiko"))
+        .args([
+            "--profile",
+            "vps",
+            "--gateway-url",
+            "https://198.51.100.7",
+            "status",
+        ])
+        .env_remove("AIKO_CLOUD_BEARER_TOKEN")
+        .env("AIKO_REMOTE_TOKEN", "mac-remote-token")
+        .env("HOME", &root)
+        .env("AIKO_CONFIG_FILE", root.join("config.json"))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
     std::fs::remove_dir_all(root).unwrap();
 }
